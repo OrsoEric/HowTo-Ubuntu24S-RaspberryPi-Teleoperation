@@ -283,12 +283,12 @@ def get_motor_command():
         R -= speed
 
     if left:
-        L -= speed
-        R += speed
-
-    if right:
         L += speed
         R -= speed
+
+    if right:
+        L -= speed
+        R += speed
 
     L = max(-127, min(127, L))
     R = max(-127, min(127, R))
