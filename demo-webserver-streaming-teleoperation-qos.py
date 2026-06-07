@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 Combined High-Performance libcamera Streamer & Robot Teleoperation Server
+With Live Server-Side FPS and Latency Push telemetry over WebSockets.
+
 Usage:
 
 source .venv/bin/activate
-uv pip install numpy
-uv pip install pillow
-export PYTHONPATH=$HOME/libcamera/build/src/py:$PYTHONPATH
 
-python demo-webserver-streaming-teleoperation-qos.py
+export PYTHONPATH=$HOME/libcamera/build/src/py:$PYTHONPATH
+python combined_stream_teleop.py
 """
 
 import io
@@ -52,7 +52,7 @@ telemetry_registry = {}
 
 # Robot control configurations
 BAUDRATE = 115200
-SEND_PERIOD = 0.25
+SEND_PERIOD = 0.1
 pressed_keys = set()
 key_lock = threading.Lock()
 
@@ -163,15 +163,26 @@ COMBINED_HTML = b"""<!DOCTYPE html>
 <body style="background:#111; color:white; text-align:center; font-family:sans-serif; margin:0; padding:20px;">
 
     <h1>Raspberry Pi Core Console</h1>
-    <p style="color:#aaa;">Use <b>WASD</b> or <b>Arrow Keys</b> to teleoperate wheels while tracking performance telemetry.</p>
+    <p style="color:#aaa; margin-bottom: 20px;">Use <b>WASD</b> or <b>Arrow Keys</b> to teleoperate wheels while tracking performance telemetry.</p>
     
     <canvas id="videoCanvas" style="width:90%; max-width:1080px; border:2px solid #444; background:#000; border-radius:4px;"></canvas>
-    <div id="status" style="margin-top:10px; color:#00ffcc; font-family:monospace;">Connecting control pipelines...</div>
+    
+    <div style="margin: 15px auto; display: flex; justify-content: center; gap: 30px; font-family: monospace; font-size: 1.2em; background: #222; width: 90%; max-width: 1080px; padding: 12px 0; border-radius: 4px; border: 1px solid #333;">
+        <div>FPS: <span id="fpsVal" style="color: #00ffcc; font-weight: bold;">--</span></div>
+        <div>Total Latency: <span id="totalLatVal" style="color: #ffcc00; font-weight: bold;">--</span> ms</div>
+        <div>Network Latency: <span id="netLatVal" style="color: #ff3366; font-weight: bold;">--</span> ms</div>
+    </div>
+
+    <div id="status" style="margin-top:10px; color:#888; font-family:monospace;">Connecting control pipelines...</div>
 
     <script>
         const canvas = document.getElementById('videoCanvas');
         const ctx = canvas.getContext('2d');
         const statusDiv = document.getElementById('status');
+        
+        const fpsVal = document.getElementById('fpsVal');
+        const totalLatVal = document.getElementById('totalLatVal');
+        const netLatVal = document.getElementById('netLatVal');
 
         const BOUNDARY_BYTES = new Uint8Array([45, 45, 102, 114, 97, 109, 101, 13, 10]); 
         const HEADER_SEP = new Uint8Array([13, 10, 13, 10]);                                    
@@ -186,6 +197,18 @@ COMBINED_HTML = b"""<!DOCTYPE html>
         wsTelemetry.onclose = () => { statusDiv.innerText = "Telemetry link disconnected."; };
         wsRobot.onopen = () => { console.log("Robot teleoperation channel established."); };
         wsRobot.onclose = () => { console.log("Robot teleoperation channel dropped."); };
+
+        // Handle Live Metrics pushes from Server
+        wsTelemetry.onmessage = (e) => {
+            try {
+                const metrics = JSON.parse(e.data);
+                fpsVal.innerText = metrics.fps;
+                totalLatVal.innerText = metrics.total_latency;
+                netLatVal.innerText = metrics.network_latency;
+            } catch(err) {
+                console.error("Error parsing pushed telemetry:", err);
+            }
+        };
 
         // Keyboard Teleoperation Listeners
         document.addEventListener("keydown", (e) => {
@@ -314,7 +337,6 @@ class MultiProtocolHandler(BaseHTTPRequestHandler):
         return  
 
     def do_GET(self):
-        # Route WebSocket upgrades based on URL endpoint pathing
         if self.headers.get("Upgrade", "").lower() == "websocket":
             if "/ws/telemetry" in self.path:
                 self._handle_telemetry_websocket()
@@ -455,7 +477,7 @@ class MultiProtocolHandler(BaseHTTPRequestHandler):
         
         b1, b2 = header[0], header[1]
         opcode = b1 & 0x0F
-        if opcode == 0x8: # Connection close opcode
+        if opcode == 0x8: 
             return opcode, None
 
         payload_len = b2 & 0x7F
@@ -472,8 +494,26 @@ class MultiProtocolHandler(BaseHTTPRequestHandler):
             unmasked[i] = masked_data[i] ^ mask_key[i % 4]
         return opcode, unmasked.decode("utf-8", errors="ignore")
 
+    def _send_ws_frame(self, text_message):
+        """Sends an unmasked text frame downstream to the browser client (RFC 6455)."""
+        payload = text_message.encode('utf-8')
+        length = len(payload)
+        
+        if length < 126:
+            header = struct.pack('!BB', 0x81, length)
+        elif length < 65536:
+            header = struct.pack('!BBH', 0x81, 126, length)
+        else:
+            header = struct.pack('!BBQ', 0x81, 127, length)
+            
+        try:
+            self.wfile.write(header + payload)
+            self.wfile.flush()
+        except Exception as e:
+            print(f"[WS TX Error] Failed sending data down channel: {e}")
+
     # --------------------------------------------------
-    # ENDPOINT 1: TELEMETRY LATENCY PROFILER
+    # ENDPOINT 1: TELEMETRY LATENCY PROFILER + OUTBOUND STATUS
     # --------------------------------------------------
     def _handle_telemetry_websocket(self):
         global active_generation, current_client_id
@@ -483,6 +523,9 @@ class MultiProtocolHandler(BaseHTTPRequestHandler):
         with state_lock:
             my_ws_generation = active_generation
 
+        # Track structural confirmation arrivals for server-side FPS measurement
+        arrival_timestamps = []
+
         while True:
             try:
                 opcode, message = self._read_ws_frame()
@@ -490,6 +533,17 @@ class MultiProtocolHandler(BaseHTTPRequestHandler):
                     break
                 
                 recv_ts = time.perf_counter()
+                arrival_timestamps.append(recv_ts)
+                
+                # Maintain sliding window of last 25 frames for calculation smoothings
+                if len(arrival_timestamps) > 25:
+                    arrival_timestamps.pop(0)
+
+                # Calculate calculated confirmation frequency rate
+                if len(arrival_timestamps) > 1:
+                    fps = (len(arrival_timestamps) - 1) / (arrival_timestamps[-1] - arrival_timestamps[0])
+                else:
+                    fps = 0.0
 
                 try:
                     data = json.loads(message)
@@ -508,10 +562,18 @@ class MultiProtocolHandler(BaseHTTPRequestHandler):
                             
                             print(
                                 f"[Telemetry][Frame #{target_idx}] "
-                                f"Timestamps -> Cap: {cap_ts:.4f}, Snd: {snd_ts:.4f}, Recv: {recv_ts:.4f} | "
                                 f"Total Latency: {latency_total:.2f}ms | "
-                                f"Network Latency: {latency_network:.2f}ms"
+                                f"Network Latency: {latency_network:.2f}ms | Pushed Window Rate: {fps:.1f} FPS"
                             )
+
+                            # Push live computed telemetry down to client interface
+                            outbound_payload = {
+                                "fps": f"{fps:.1f}",
+                                "total_latency": f"{latency_total:.2f}",
+                                "network_latency": f"{latency_network:.2f}"
+                            }
+                            self._send_ws_frame(json.dumps(outbound_payload))
+
                 except Exception as e:
                     print(f"[Telemetry Error] Parsing failure: {e}")
 
@@ -640,7 +702,6 @@ if __name__ == "__main__":
     else:
         print("[main] WARNING: No responsive UART controllers identified. Moving to mock loop.")
 
-    # Starting unified processing server on mapped port 8080
     server = ThreadingHTTPServer((HOST, PORT), MultiProtocolHandler)
     print(f"[server] Core engine hosting streams and controls live on http://localhost:{PORT}")
 
